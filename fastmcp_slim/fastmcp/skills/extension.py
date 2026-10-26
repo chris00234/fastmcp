@@ -2,18 +2,20 @@
 
 from __future__ import annotations
 
+from collections import Counter
 from collections.abc import Sequence
 from typing import TYPE_CHECKING, Any
 
-from mcp import MCPError
 from mcp.server.context import ServerRequestContext
-from mcp_types import INVALID_PARAMS, METHOD_NOT_FOUND
+from mcp.shared.exceptions import MCPError
+from mcp_types import INVALID_PARAMS
 from mcp_types.version import MODERN_PROTOCOL_VERSIONS
 
+from fastmcp.server.context import Context
 from fastmcp.server.extensions import MethodBinding, ServerExtension
 from fastmcp.server.mixins.mcp_operations import _apply_pagination
 from fastmcp.server.providers.base import Provider
-from fastmcp.skills._composition import _AggregateSkills, _ServerSkills
+from fastmcp.skills._composition import _mounted_source
 from fastmcp.skills._constants import SKILLS_EXTENSION_ID
 from fastmcp.skills._source import _SkillSource
 from fastmcp.skills.models import (
@@ -21,37 +23,58 @@ from fastmcp.skills.models import (
     GetSkillResult,
     ListSkillsParams,
     ListSkillsResult,
+    MCPSkill,
 )
+from fastmcp.utilities.async_utils import gather
+from fastmcp.utilities.logging import get_logger
 
 if TYPE_CHECKING:
     from fastmcp.server.server import FastMCP
+
+logger = get_logger(__name__)
 
 _SKILLS_METHOD_VERSIONS = frozenset(MODERN_PROTOCOL_VERSIONS)
 
 
 class SkillsExtension(ServerExtension):
-    """Expose caller-scoped and proxied skill sources through SEP-2640 methods."""
+    """Expose caller-scoped skill sources through SEP-2640 methods.
+
+    Skill providers register this extension automatically, so most servers
+    never construct it. With no `providers`, it serves every skill source
+    registered directly on the server plus the skills of mounted servers,
+    rewritten to the URIs the parent serves them at. Pass `providers` to limit
+    discovery to an explicit list of directly registered providers.
+    """
 
     identifier = SKILLS_EXTENSION_ID
+    auto_register = True
 
-    def __init__(self, *, providers: Sequence[Provider]) -> None:
-        if not providers:
-            raise ValueError("SkillsExtension requires at least one provider")
-        if len({id(provider) for provider in providers}) != len(providers):
-            raise ValueError("SkillsExtension providers must be unique")
-        self._providers = tuple(providers)
+    def __init__(self, *, providers: Sequence[Provider] | None = None) -> None:
+        if providers is not None:
+            if not providers:
+                raise ValueError("SkillsExtension requires at least one provider")
+            if len({id(provider) for provider in providers}) != len(providers):
+                raise ValueError("SkillsExtension providers must be unique")
+        self._providers = None if providers is None else tuple(providers)
+
+    def clone(self) -> SkillsExtension:
+        # A copy registered on a parent server discovers that server's sources.
+        return SkillsExtension()
 
     def _bind(self, server: FastMCP) -> None:
-        self._validate_configuration(server)
+        if self._providers is not None:
+            self._validate_configuration(server, self._providers)
         super()._bind(server)
 
-    def _validate_configuration(self, server: FastMCP) -> tuple[_SkillSource, ...]:
+    def _validate_configuration(
+        self, server: FastMCP, providers: Sequence[Provider]
+    ) -> None:
         if server.transforms:
             raise ValueError(
                 "SkillsExtension does not yet support server-level transforms"
             )
-        sources = []
-        for provider in self._providers:
+
+        for provider in providers:
             if not any(registered is provider for registered in server.providers):
                 raise ValueError(
                     "SkillsExtension providers must be registered directly on the "
@@ -63,49 +86,47 @@ class SkillsExtension(ServerExtension):
                 )
             if not isinstance(provider, _SkillSource):
                 raise TypeError(
-                    f"{type(provider).__name__} is not a SkillsExtension source"
+                    f"{type(provider).__name__} is not a SkillsExtension source; "
+                    "use SkillCatalogProvider to publish Skill objects"
                 )
+
             provider._validate_skill_source()
-            sources.append(provider)
-        return tuple(sources)
 
     @property
-    def _source(self) -> _SkillSource | None:
-        sources = list(self._validate_configuration(self.server))
-        proxied = self.server._get_skills_source()
-        if proxied is not None:
-            sources.append(proxied)
-        if not sources:
-            return None
-        aggregate = _AggregateSkills(
-            sources, error_strategy=self.server.provider_error_strategy
+    def _sources(self) -> tuple[_SkillSource, ...]:
+        if self._providers is not None:
+            self._validate_configuration(self.server, self._providers)
+        return self._candidate_sources()
+
+    def _candidate_sources(self) -> tuple[_SkillSource, ...]:
+        server = self.server
+        if self._providers is not None:
+            return tuple(
+                provider
+                for provider in self._providers
+                if isinstance(provider, _SkillSource)
+            )
+        if server.transforms:
+            return ()
+        sources: list[_SkillSource] = []
+        for provider in server.providers:
+            mounted = _mounted_source(provider)
+            if mounted is not None:
+                sources.append(mounted)
+            elif isinstance(provider, _SkillSource) and not provider.transforms:
+                try:
+                    provider._validate_skill_source()
+                except ValueError:
+                    continue
+                sources.append(provider)
+        return tuple(sources)
+
+    def _requires_live_resource(self, uri: str) -> bool:
+        """Keep manifest-backed resources coherent with current file bytes."""
+        # Never raise here: response caching asks on every resource read.
+        return any(
+            source._owns_skill_resource(uri) for source in self._candidate_sources()
         )
-        return _ServerSkills(aggregate, self.server)
-
-    def _require_source(self) -> _SkillSource:
-        source = self._source
-        if source is None:
-            raise MCPError(code=METHOD_NOT_FOUND, message="Skills are not supported")
-        return source
-
-    async def _requires_live_resource(self, uri: str) -> bool:
-        """Keep manifest-backed resources coherent with current file bytes.
-
-        This runs on every resource read, so it skips configuration validation:
-        a misconfigured extension fails Skills requests, not unrelated reads.
-        """
-        sources: list[_SkillSource] = [
-            provider
-            for provider in self._providers
-            if isinstance(provider, _SkillSource)
-        ]
-        proxied = self.server._get_skills_source()
-        if proxied is not None:
-            sources.append(proxied)
-        for source in sources:
-            if await source._owns_skill_resource(uri):
-                return True
-        return False
 
     def methods(self) -> Sequence[MethodBinding]:
         return (
@@ -123,38 +144,72 @@ class SkillsExtension(ServerExtension):
             ),
         )
 
+    async def _identities(self, uri: str | None = None) -> list[str]:
+        """Skill URIs before authorization, preserving duplicates across sources."""
+        sources = self._sources
+        async with Context(fastmcp=self.server):
+            groups = await gather(source._skill_uris(uri) for source in sources)
+        return [identity for group in groups for identity in group]
+
+    async def _list_entries(
+        self, context: ServerRequestContext[Any, Any]
+    ) -> list[MCPSkill]:
+        sources = self._sources
+        async with Context(fastmcp=self.server):
+            source_entries = await gather(
+                source._list_skill_entries(context) for source in sources
+            )
+        counts = Counter(await self._identities())
+        collisions = sorted(uri for uri, count in counts.items() if count > 1)
+        if collisions:
+            logger.warning(
+                "Omitting duplicate Skills entries for URIs: %s",
+                ", ".join(collisions),
+            )
+        return sorted(
+            (
+                entry
+                for group in source_entries
+                for entry in group
+                if counts[entry.uri] == 1
+            ),
+            key=lambda entry: entry.uri,
+        )
+
+    async def _get_entry(
+        self, uri: str, context: ServerRequestContext[Any, Any]
+    ) -> MCPSkill | None:
+        if (await self._identities(uri)).count(uri) != 1:
+            return None
+        sources = self._sources
+        async with Context(fastmcp=self.server):
+            results = await gather(
+                source._get_skill_entry(uri, context) for source in sources
+            )
+        matches = [entry for entry in results if entry is not None]
+        if len(matches) != 1 or matches[0].uri != uri:
+            return None
+        return matches[0]
+
     async def _handle_list(
-        self, context: ServerRequestContext[Any, Any], params: ListSkillsParams
+        self,
+        context: ServerRequestContext[Any, Any],
+        params: ListSkillsParams,
     ) -> ListSkillsResult:
-        catalog = await self._require_source()._list_skill_entries(context)
+        entries = await self._list_entries(context)
         page, next_cursor = _apply_pagination(
-            catalog.skills, params.cursor, self.server._list_page_size
+            entries, params.cursor, self.server._list_page_size
         )
         return ListSkillsResult(skills=page, next_cursor=next_cursor)
 
     async def _handle_get(
-        self, context: ServerRequestContext[Any, Any], params: GetSkillParams
+        self,
+        context: ServerRequestContext[Any, Any],
+        params: GetSkillParams,
     ) -> GetSkillResult:
-        lookup = await self._require_source()._get_skill_entry(params.uri, context)
-        if (
-            lookup.matches != 1
-            or lookup.skill is None
-            or lookup.skill.uri != params.uri
-        ):
+        entry = await self._get_entry(params.uri, context)
+        if entry is None:
             raise MCPError(
                 code=INVALID_PARAMS, message=f"Unknown skill URI: {params.uri}"
             )
-        return GetSkillResult(skill=lookup.skill)
-
-
-class _ProxySkillsExtension(SkillsExtension):
-    """Installed on every server; advertised only when a proxied backend has Skills."""
-
-    def __init__(self) -> None:
-        self._providers = ()
-
-    def _validate_configuration(self, server: FastMCP) -> tuple[_SkillSource, ...]:
-        return ()
-
-    def _is_advertised(self) -> bool:
-        return self._source is not None
+        return GetSkillResult(skill=entry)

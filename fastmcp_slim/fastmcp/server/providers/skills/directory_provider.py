@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections import Counter
 from collections.abc import Sequence
 from pathlib import Path
-from typing import Any, Literal
+from typing import TYPE_CHECKING, Any, Literal
 from urllib.parse import quote, unquote
 
 import yaml
@@ -13,6 +13,7 @@ from anyio.to_thread import run_sync
 from mcp.server.context import ServerRequestContext
 from mcp.shared.path_security import PathEscapeError, safe_join
 
+from fastmcp.exceptions import AuthorizationError
 from fastmcp.resources.base import Resource
 from fastmcp.resources.template import ResourceTemplate
 from fastmcp.server.dependencies import get_context
@@ -26,15 +27,17 @@ from fastmcp.server.providers.skills.skill_provider import (
 )
 from fastmcp.skills._resources import is_skill_file
 from fastmcp.skills._snapshot import Snapshot, snapshot
-from fastmcp.skills._source import _Catalog, _Lookup, _SkillSource
-from fastmcp.skills.models import Skill
+from fastmcp.skills.models import MCPSkill
 from fastmcp.utilities.logging import get_logger
 from fastmcp.utilities.versions import VersionSpec
+
+if TYPE_CHECKING:
+    from fastmcp.server.extensions import ServerExtension
 
 logger = get_logger(__name__)
 
 
-class SkillsDirectoryProvider(AggregateProvider, _SkillSource):
+class SkillsDirectoryProvider(AggregateProvider):
     """Provider that scans directories and creates a SkillProvider per skill folder.
 
     This extends AggregateProvider to combine multiple SkillProviders into one.
@@ -374,7 +377,7 @@ class SkillsDirectoryProvider(AggregateProvider, _SkillSource):
         provider = self._resource_provider(root, name, relative)
         return await provider.get_resource_template(uri, version)
 
-    async def _visible_entry(self, snap: Snapshot) -> Skill | None:
+    async def _visible_entry(self, snap: Snapshot) -> MCPSkill | None:
         server = get_context().fastmcp
         for uri, path in snap.files:
             component: Resource | ResourceTemplate | None = await server.get_resource(
@@ -396,47 +399,66 @@ class SkillsDirectoryProvider(AggregateProvider, _SkillSource):
                 params = component.matches(uri)
                 if params is None or component.skill_info.path / params["path"] != path:
                     return None
+            try:
+                await server._check_resource_access(uri)
+            except AuthorizationError:
+                return None
         return snap.entry
 
     async def _list_skill_entries(
         self, context: ServerRequestContext[Any, Any]
-    ) -> _Catalog:
+    ) -> Sequence[MCPSkill]:
         entries = []
         for snap in await run_sync(self._snapshots):
             entry = await self._visible_entry(snap)
             if entry is not None:
                 entries.append(entry)
-        return _Catalog(entries, tuple(await self._skill_uris()))
+        return entries
 
     async def _get_skill_entry(
         self, uri: str, context: ServerRequestContext[Any, Any]
-    ) -> _Lookup:
+    ) -> MCPSkill | None:
         parts = self._uri_parts(uri)
         if parts is None or parts[-1] != "SKILL.md":
-            return _Lookup()
+            return None
         name = "/".join(parts[:-1])
         directories = self._directories_for_name(name)
         if len(directories) != 1:
-            return _Lookup(matches=len(directories))
+            return None
         try:
             snap = await run_sync(snapshot, directories[0], name)
         except (OSError, ValueError, yaml.YAMLError, RecursionError) as exc:
             logger.warning("Omitting invalid skill %s: %s", directories[0], exc)
-            return _Lookup(matches=1)
-        return _Lookup(matches=1, skill=await self._visible_entry(snap))
+            return None
+        return await self._visible_entry(snap)
 
-    async def _owns_skill_resource(self, uri: str) -> bool:
+    def _owns_skill_resource(self, uri: str) -> bool:
         parts = self._uri_parts(uri)
         return parts is not None and any(
             self._directories_for_name("/".join(parts[:length]))
             for length in range(len(parts) - 1, 0, -1)
         )
 
+    def required_extensions(self) -> Sequence[ServerExtension]:
+        if not self._experimental_skills:
+            return ()
+        from fastmcp.skills.extension import SkillsExtension
+
+        return (SkillsExtension(),)
+
     def _validate_skill_source(self) -> None:
         if not self._experimental_skills:
             raise ValueError("Skills discovery requires experimental_skills=True")
 
-    async def _skill_uris(self) -> list[str]:
+    async def _skill_uris(self, uri: str | None = None) -> Sequence[str]:
         self._validate_skill_source()
-        candidates = await run_sync(self._candidate_directories)
-        return [f"skill://{quote(name, safe='/')}/SKILL.md" for name, _ in candidates]
+        if uri is None:
+            candidates = await run_sync(self._candidate_directories)
+            return [
+                f"skill://{quote(name, safe='/')}/SKILL.md" for name, _ in candidates
+            ]
+        parts = self._uri_parts(uri)
+        if parts is None or parts[-1] != "SKILL.md":
+            return []
+        directories = self._directories_for_name("/".join(parts[:-1]))
+        return [uri] * len(directories)
