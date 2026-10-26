@@ -41,9 +41,10 @@ class SkillsExtension(ServerExtension):
 
     Skill providers register this extension automatically, so most servers
     never construct it. With no `providers`, it serves every skill source
-    registered directly on the server plus the skills of mounted servers,
-    rewritten to the URIs the parent serves them at. Pass `providers` to limit
-    discovery to an explicit list of directly registered providers.
+    registered directly on the server, the skills of each `ProxyProvider`'s
+    backend, and the skills of mounted servers, rewritten to the URIs the
+    parent serves them at. Pass `providers` to limit discovery to an explicit
+    list of directly registered skill providers.
     """
 
     identifier = SKILLS_EXTENSION_ID

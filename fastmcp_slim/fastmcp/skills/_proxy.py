@@ -6,13 +6,11 @@ from collections.abc import AsyncGenerator, Sequence
 from contextlib import asynccontextmanager
 from typing import Any
 
-import anyio
 from mcp.server.context import ServerRequestContext
 from mcp.shared.exceptions import MCPError
 from mcp_types import INVALID_PARAMS, METHOD_NOT_FOUND
 
 from fastmcp.client.client import Client
-from fastmcp.exceptions import AuthorizationError
 from fastmcp.server.dependencies import get_context
 from fastmcp.server.providers.base import Provider
 from fastmcp.server.providers.proxy import (
@@ -24,6 +22,7 @@ from fastmcp.server.providers.proxy import (
     _proxy_upstream_error,
     _session_request_meta,
 )
+from fastmcp.skills._routing import _may_read, _resolve_read
 from fastmcp.skills.models import (
     GetSkillParams,
     GetSkillRequest,
@@ -75,22 +74,18 @@ class _ProxiedSkills:
     async def _listed(self) -> list[MCPSkill]:
         # skills/list asks for identities and entries separately; one backend
         # call per request answers both.
-        context = get_context()
+        state = get_context()._request_state
         key = f"_fastmcp_proxied_skills:{id(self._provider)}"
-        lock = context._request_state.setdefault(f"{key}:lock", anyio.Lock())
-        async with lock:
-            if key not in context._request_state:
-                context._request_state[key] = await self._list_backend()
-            return context._request_state[key]
+        if key not in state:
+            state[key] = await self._list_backend()
+        return state[key]
 
     async def _fetched(self, uri: str) -> MCPSkill | None:
-        context = get_context()
+        state = get_context()._request_state
         key = f"_fastmcp_proxied_skill:{id(self._provider)}:{uri}"
-        lock = context._request_state.setdefault(f"{key}:lock", anyio.Lock())
-        async with lock:
-            if key not in context._request_state:
-                context._request_state[key] = await self._get_backend(uri)
-            return context._request_state[key]
+        if key not in state:
+            state[key] = await self._get_backend(uri)
+        return state[key]
 
     @asynccontextmanager
     async def _client(self) -> AsyncGenerator[Client]:
@@ -144,34 +139,16 @@ class _ProxiedSkills:
             return False
         server = get_context().fastmcp
         for record in entry.resources:
-            resource, exists = await server._lookup_resource(record.uri)
-            if resource is not None:
-                if not self._is_backend(resource):
-                    return False
-            elif exists:
-                # A hidden concrete resource blocks the template, as in reads.
-                return False
-            else:
-                # Creating a proxied resource from a template reads the backend,
-                # so a matching template is enough.
-                template = await server.get_resource_template(record.uri)
-                if not (
-                    self._is_backend(template)
-                    and isinstance(template, ProxyTemplate)
-                    and template.matches(record.uri) is not None
-                ):
-                    return False
-            try:
-                await server._check_resource_access(record.uri)
-            except AuthorizationError:
+            component = await _resolve_read(server, record.uri)
+            # Creating a resource from a proxied template reads the backend, so
+            # the template itself counts.
+            if not (
+                isinstance(component, ProxyResource | ProxyTemplate)
+                and component._client_factory is self._provider.client_factory
+                and await _may_read(server, record.uri)
+            ):
                 return False
         return True
-
-    def _is_backend(self, component: object) -> bool:
-        return (
-            isinstance(component, ProxyResource | ProxyTemplate)
-            and component._client_factory is self._provider.client_factory
-        )
 
 
 def _proxied_source(provider: Provider) -> _ProxiedSkills | None:
