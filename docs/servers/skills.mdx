@@ -181,6 +181,33 @@ The parent lists a mounted skill only when it routes every file back to the chil
 
 To limit discovery to specific providers instead, register the extension yourself with `mcp.add_extension(SkillsExtension(providers=[...]))`. An explicit registration replaces the automatic one and doesn't include mounted servers.
 
+## Proxied servers
+
+A [proxy](/servers/providers/proxy) forwards a backend's skill files as ordinary resources. It doesn't turn on Skills discovery by itself, because a proxy doesn't know which extensions its backend supports. Register `SkillsExtension` on the proxying server, and its `skills/list` and `skills/get` will include the skills of every `ProxyProvider` on that server, next to any skills it serves locally:
+
+```python
+from fastmcp import FastMCP
+from fastmcp.server.providers.proxy import ProxyClient, ProxyProvider
+from fastmcp.skills import Skill
+from fastmcp.skills.extension import SkillsExtension
+from fastmcp.skills.provider import SkillCatalogProvider
+
+notes = Skill(
+    name="release-notes",
+    description="Write release notes from merged pull requests.",
+    instructions="# Release notes\n",
+)
+
+gateway = FastMCP("Gateway")
+gateway.add_provider(ProxyProvider(lambda: ProxyClient("https://backend.example/mcp")))
+gateway.add_provider(SkillCatalogProvider([notes]))
+gateway.add_extension(SkillsExtension())
+```
+
+The proxy passes the backend's entries through unchanged and never reads a skill file during discovery. A backend that doesn't support the extension contributes no skills. As with mounts, an entry is listed only when the proxying server routes every file in its manifest to that same backend and the caller passes the server's access checks.
+
+To namespace a backend's skills, register `SkillsExtension` on the proxy server and mount it: `proxy.add_extension(SkillsExtension())`, then `gateway.mount(proxy, namespace="github")`.
+
 ## Read skills from a client
 
 ### Read skills as resources
@@ -314,10 +341,10 @@ A mismatch means the file changed between discovery and the read. Refresh the en
 
 ## Current limits
 
-Skills discovery serves skills from `SkillCatalogProvider` and `SkillsDirectoryProvider` instances registered on the server you run or on servers mounted into it.
+Skills discovery serves skills from `SkillCatalogProvider` and `SkillsDirectoryProvider` instances and proxy backends registered on the server you run or on servers mounted into it.
 
-- A skill provider added with a namespace or other transforms is left out of `skills/list`. To namespace skills, mount a server that holds the provider. A server with server-level transforms lists no skills.
-- A proxy in front of the server forwards the skill files as resources, but not `skills/list` or `skills/get`.
+- A skill provider or `ProxyProvider` added with a namespace or other transforms is left out of `skills/list`. To namespace skills, mount a server that holds the provider. A server with server-level transforms lists no skills.
+- A proxied entry whose manifest is `"dynamic"` is left out, because the proxying server can't check its files.
 - `SkillCatalogProvider` does not nest skills inside other skills and has no built-in reload; override `load_skills()` for skills that change.
 - The optional `directoryRead` capability is not implemented.
 

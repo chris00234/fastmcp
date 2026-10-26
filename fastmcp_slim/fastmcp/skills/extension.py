@@ -108,11 +108,14 @@ class SkillsExtension(ServerExtension):
             )
         if server.transforms:
             return ()
+        # Deferred so that registering Skills doesn't load the client stack.
+        from fastmcp.skills._proxy import _proxied_source
+
         sources: list[_SkillSource] = []
         for provider in server.providers:
-            mounted = _mounted_source(provider)
-            if mounted is not None:
-                sources.append(mounted)
+            source = _mounted_source(provider) or _proxied_source(provider)
+            if source is not None:
+                sources.append(source)
             elif isinstance(provider, _SkillSource) and not provider.transforms:
                 try:
                     provider._validate_skill_source()
